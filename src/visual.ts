@@ -1,7 +1,18 @@
 // @ts-nocheck
-// v3.7.45: AppSource license manager — strict model (Desktop + Service).
-// Edit mode without an active license = editor UI locked + trial banner.
-// View mode = always rendered, no license check.
+// v3.8.0: freemium model, replacing the v3.7.45 all-or-nothing gate.
+//
+// Free, in Desktop and Service alike:
+//   - up to FREE_AREA_LIMIT areas, each with up to FREE_MACHINES_PER_AREA machines
+//   - the full shift schedule, products, cycle times, buffers, goals and routing
+//   - the Logistics page and the per-area Plan pages
+//
+// Licensed:
+//   - more areas / more machines per area
+//   - virtual machines (splitting one physical machine into named lanes)
+//   - the Gantt page and the Pipeline Map page
+//
+// Locked pages keep their tab and explain what they show, so a prospect can see
+// what the license buys instead of finding a blank visual.
 const VALID_PLAN_IDS = [
     "plan_trial",
     "plan_monthly",
@@ -11,6 +22,8 @@ const VALID_PLAN_IDS = [
 ];
 const APPSOURCE_OFFER_URL =
     "https://appsource.microsoft.com/product/power-bi-visuals/productionvisual.production-plan?tab=Overview";
+const FREE_AREA_LIMIT = 3;
+const FREE_MACHINES_PER_AREA = 2;
 
 const SHIFT_TEMPLATES = [
     { label_hu: "5/2 nyolc óra (8h)", label_en: "5/2 eight hours (8h)", minutes: 480, shifts: 2, workDays: 5 },
@@ -216,9 +229,25 @@ const TRANSLATIONS = {
         onlineProduction: "Online prod. likely",
         supplyGap: "Gap",
         needed: "Needed",
-        licenseRequired: "Editor license required",
-        licenseDescription: "Viewers always see the visual for free. Only editors need a license to change settings.",
-        startTrial: "Start 30-day free trial"
+        licenseRequired: "Free version",
+        licenseDescription: "Up to {a} areas with {m} machines each. More areas, virtual machines, "
+            + "the Gantt page and the Pipeline Map need a license.",
+        startTrial: "Start 30-day free trial",
+        freeTier: "Free version",
+        viewLicense: "See plans",
+        lockedIncluded: "Included in every paid plan, and in the 30-day free trial.",
+        lockedPageTitle: "This page needs a license",
+        lockedGanttBody: "The Gantt page lays every product out on a shift-by-shift timeline for the "
+            + "selected area, so you can see what runs when, and where the schedule collides.",
+        lockedMapBody: "The Pipeline Map shows the whole production chain from above — every area, "
+            + "how they feed each other, parallel branches and bypasses, in one picture.",
+        lockedFeature: "Needs a license",
+        areaCapTitle: "Area limit reached",
+        areaCapBody: "The free version covers {a} areas. A license removes the limit.",
+        machineCapTitle: "Machine limit reached",
+        machineCapBody: "The free version covers {m} machines per area. A license removes the limit.",
+        virtualLockedBody: "Virtual machines let you split one physical machine from your data into "
+            + "several named lanes (for example SP-1 Pinion and SP-1 Ring), each planned separately."
     },
     hu: {
         title: "Production Plan",
@@ -398,9 +427,25 @@ const TRANSLATIONS = {
         supplyWarningTip: "Az upstream kapacitás + puffer nem biztos, hogy fedezi az igényt",
         onlineProduction: "Online gyártás valószínű",
         supplyGap: "Hiány",
-        licenseRequired: "Szerkesztői licenc szükséges",
-        licenseDescription: "A nézők mindig ingyen látják a vizuált. Csak a szerkesztőknek kell licenc a beállítások módosításához.",
-        startTrial: "30 napos ingyenes próba indítása"
+        licenseRequired: "Ingyenes verzió",
+        licenseDescription: "{a} területig, területenként {m} géppel. A további területekhez, a "
+            + "virtuális gépekhez, a Gantt oldalhoz és a Pipeline térképhez licenc kell.",
+        startTrial: "30 napos ingyenes próba indítása",
+        freeTier: "Ingyenes verzió",
+        viewLicense: "Csomagok megtekintése",
+        lockedIncluded: "Minden fizetős csomagban benne van, és a 30 napos ingyenes próbában is.",
+        lockedPageTitle: "Ehhez az oldalhoz licenc kell",
+        lockedGanttBody: "A Gantt oldal minden terméket műszakról műszakra egy idővonalon mutat az "
+            + "adott területre — látszik, mi mikor fut, és hol ütközik az ütemterv.",
+        lockedMapBody: "A Pipeline térkép felülnézetből mutatja a teljes gyártási láncot: minden "
+            + "területet, hogy melyik melyiket táplálja, a párhuzamos ágakat és a kerülőket, egy képen.",
+        lockedFeature: "Licenc szükséges",
+        areaCapTitle: "Terület-korlát elérve",
+        areaCapBody: "Az ingyenes verzió {a} területet kezel. Licenccel megszűnik a korlát.",
+        machineCapTitle: "Gépszám-korlát elérve",
+        machineCapBody: "Az ingyenes verzió területenként {m} gépet kezel. Licenccel megszűnik a korlát.",
+        virtualLockedBody: "A virtuális gépekkel egy fizikai gépet több elnevezett lane-re bonthatsz "
+            + "(például SP-1 Pinion és SP-1 Ring), és mindegyiket külön tervezheted."
     },
 };
 
@@ -520,8 +565,17 @@ export class Visual {
     modalOverlay = null;
     isPersisting = false;
     shiftSectionCollapsed = false;
-    // v3.7.45: AppSource license state (async — checked once per session)
-    hasValidLicense = false;
+    // v3.8.0: AppSource license state (async — checked once per session).
+    // hasPlan = the ACTIVE USER holds an Active/Warning plan for this visual.
+    // licenseStamp = the REPORT was configured by a licensed editor; this is what
+    //   keeps viewers free (they never hold a plan of their own) and what keeps
+    //   REST-API PDF/PPT export correct (plan info is unavailable there).
+    // licenseEvaluable = licensing can actually be judged here (signed in, online,
+    //   supported environment) — only then may the stamp be written or cleared.
+    hasPlan = false;
+    licenseStamp = false;
+    licenseEvaluable = false;
+    licenseUnsupportedEnv = false;
     licenseChecked = false;
     licensePromise = null;
     selectionManager = null;
@@ -576,72 +630,218 @@ export class Visual {
         }
     }
 
-    // v3.7.45: AppSource license check. Runs once per session; result cached for
-    // the lifetime of the visual. Failures default to "no license" (strict).
+    // v3.8.0: AppSource license check. Runs once per session; the host caches the
+    // result for the session anyway. A failed lookup means "can't tell" — the
+    // visual falls back to the free tier and never touches the stamp.
     startLicenseCheck() {
         if (this.licensePromise) return;
         const lm = this.host && this.host.licenseManager;
         if (!lm || typeof lm.getAvailableServicePlans !== "function") {
             this.licenseChecked = true;
-            this.hasValidLicense = false;
+            this.licenseEvaluable = false;
             return;
         }
         this.licensePromise = Promise.resolve(lm.getAvailableServicePlans()).then(
             (result) => {
-                const plans = (result && result.plans) || [];
-                this.hasValidLicense = plans.some(
-                    (p) => {
-                        if (!p) { return false; }
-                        // state is a numeric enum at runtime (Active=1, Warning=2) — both are usable licenses.
-                        const stateOk = p.state === 1 || p.state === 2 || p.state === "Active" || p.state === "Warning";
-                        // spIdentifier is the Partner Center GENERATED Service ID
-                        // (e.g. "<publisher>.<offer>.<planId>"), not the bare plan ID — match on the planId part.
-                        const sp = String(p.spIdentifier || "");
-                        return stateOk && VALID_PLAN_IDS.some((id) => sp.indexOf(id) >= 0);
-                    }
-                );
+                const info = result || {};
+                this.licenseUnsupportedEnv = !!info.isLicenseUnsupportedEnv;
+                const infoAvailable = info.isLicenseInfoAvailable !== false;
+                this.licenseEvaluable = infoAvailable && !this.licenseUnsupportedEnv;
+                if (this.licenseEvaluable) {
+                    const plans = info.plans || [];
+                    this.hasPlan = plans.some(
+                        (p) => {
+                            if (!p) { return false; }
+                            // Only Active (1) and Warning (2) are usable licenses.
+                            const stateOk = p.state === 1 || p.state === 2 || p.state === "Active" || p.state === "Warning";
+                            // spIdentifier is the Partner Center GENERATED Service ID
+                            // ("<publisher>.<offer>.<planId>") — match on the planId part.
+                            const sp = String(p.spIdentifier || "");
+                            return stateOk && VALID_PLAN_IDS.some((id) => sp.indexOf(id) >= 0);
+                        }
+                    );
+                }
                 this.licenseChecked = true;
+                try { this.reconcileLicenseStamp(); } catch (_e) {}
                 try { this.render(); } catch (_e) {}
             },
             () => {
-                this.hasValidLicense = false;
+                this.hasPlan = false;
+                this.licenseEvaluable = false;
                 this.licenseChecked = true;
                 try { this.render(); } catch (_e) {}
             }
         );
     }
 
-    // Editors can change settings only if they have an active license.
-    canEdit() {
-        return this.isEditMode && this.hasValidLicense;
+    // Keep the report's stamp in step with the editor's real entitlement, so a
+    // lapsed subscription drops back to the free tier on the next edit. Only
+    // editors in an evaluable environment may write it — never viewers, never
+    // export renderers.
+    reconcileLicenseStamp() {
+        if (!this.isEditMode || !this.licenseChecked || !this.licenseEvaluable) return;
+        if (this.hasPlan === this.licenseStamp) return;
+        this.licenseStamp = this.hasPlan;
+        try {
+            this.isPersisting = true;
+            this.host.persistProperties({
+                merge: [{
+                    objectName: "areaStorage", selector: null,
+                    properties: { licenseStamp: this.hasPlan ? "1" : "" }
+                }]
+            });
+            setTimeout(() => { this.isPersisting = false; }, 300);
+        } catch (e) { this.isPersisting = false; }
     }
 
-    // Banner shown in Edit mode when no active license is found.
+    // The single question the rest of the visual asks.
+    isUnlocked() {
+        return this.hasPlan || this.licenseStamp;
+    }
+
+    // v3.8.0: editing itself is free now — the free tier is bounded by the caps
+    // and the locked pages, not by a read-only mode. Viewers still can't edit.
+    canEdit() {
+        return this.isEditMode;
+    }
+
+    canAddArea() {
+        return this.isUnlocked() || this.areas.length < FREE_AREA_LIMIT;
+    }
+
+    canAddMachine(area) {
+        if (this.isUnlocked()) return true;
+        return (area && area.machines ? area.machines.length : 0) < FREE_MACHINES_PER_AREA;
+    }
+
+    // v3.8.0: the cap applies to what is RENDERED, not only to what can be added,
+    // so a report configured under a license (or under an older build) shows the
+    // free tier honestly rather than staying unlimited.
+    //
+    // These deliberately return views over this.areas and never mutate it —
+    // saveState() persists this.areas verbatim, so truncating it in memory would
+    // destroy the customer's configuration the moment anything saved.
+    visibleAreas() {
+        return this.isUnlocked() ? this.areas : this.areas.slice(0, FREE_AREA_LIMIT);
+    }
+
+    visibleMachines(area) {
+        const machines = (area && area.machines) || [];
+        return this.isUnlocked() ? machines : machines.slice(0, FREE_MACHINES_PER_AREA);
+    }
+
+    isAreaVisible(areaId) {
+        return this.visibleAreas().some(a => a.id === areaId);
+    }
+
+    hiddenAreaCount() {
+        return Math.max(0, this.areas.length - this.visibleAreas().length);
+    }
+
+    // AppSource link — omitted where the viewer can't act on it (embed / export).
+    buildUpgradeLink(label, accent) {
+        if (this.licenseUnsupportedEnv) return null;
+        const link = document.createElement("a");
+        link.href = APPSOURCE_OFFER_URL;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = label;
+        link.style.cssText = accent
+            ? "flex-shrink:0;padding:6px 14px;background:#ffb84d;color:#1a1408;"
+            + "border-radius:4px;text-decoration:none;font-weight:600;"
+            : "flex-shrink:0;padding:8px 18px;background:#bc8cff;color:#12101a;"
+            + "border-radius:6px;text-decoration:none;font-weight:600;font-size:13px;";
+        return link;
+    }
+
+    // Translate with {a}/{m} substitution for the cap numbers.
+    tf(key, values) {
+        let out = this.t(key);
+        for (const name of Object.keys(values || {})) {
+            out = out.split("{" + name + "}").join(String(values[name]));
+        }
+        return out;
+    }
+
+    // Stand-in for a paid page. The tab stays clickable on purpose — a prospect
+    // should be able to read what the page does before deciding to buy.
+    buildLockedPage(th, titleKey, bodyKey) {
+        const page = this.el("div",
+            "display:flex;flex-direction:column;align-items:center;justify-content:center;" +
+            "text-align:center;gap:10px;padding:56px 32px;min-height:260px;");
+        const icon = this.el("div", "font-size:34px;line-height:1;opacity:0.9;");
+        icon.textContent = "🔒";
+        page.appendChild(icon);
+        const title = this.el("div", "font-size:16px;font-weight:600;color:" + th.fg + ";");
+        title.textContent = this.t(titleKey);
+        page.appendChild(title);
+        const body = this.el("div",
+            "font-size:13px;line-height:1.6;color:" + th.fgMuted + ";max-width:480px;");
+        // tf() so cap-related bodies get their numbers; harmless for the rest.
+        body.textContent = this.tf(bodyKey, { a: FREE_AREA_LIMIT, m: FREE_MACHINES_PER_AREA });
+        page.appendChild(body);
+        const note = this.el("div", "font-size:12px;color:" + th.fgMuted + ";opacity:0.8;margin-top:2px;");
+        note.textContent = this.t("lockedIncluded");
+        page.appendChild(note);
+        const link = this.buildUpgradeLink(this.t("startTrial"), false);
+        if (link) { link.style.marginTop = "8px"; page.appendChild(link); }
+        return page;
+    }
+
+    // Small modal shown when a capped "+" button is pressed.
+    showCapModal(titleKey, bodyKey, values) {
+        const th = THEMES[this.theme];
+        const overlay = this.el("div",
+            "position:absolute;inset:0;background:rgba(0,0,0,0.55);z-index:1000;" +
+            "display:flex;align-items:center;justify-content:center;padding:24px;");
+        overlay.onclick = (ev) => { if (ev.target === overlay) this.closeModal(); };
+        const panel = this.el("div",
+            "background:" + th.surface + ";border:1px solid " + th.border + ";border-radius:12px;" +
+            "padding:26px 28px;max-width:420px;text-align:center;box-shadow:" + th.shadowLg + ";");
+        const icon = this.el("div", "font-size:30px;margin-bottom:8px;");
+        icon.textContent = "🔒";
+        panel.appendChild(icon);
+        const title = this.el("div", "font-size:15px;font-weight:600;color:" + th.fg + ";margin-bottom:8px;");
+        title.textContent = this.t(titleKey);
+        panel.appendChild(title);
+        const body = this.el("div", "font-size:13px;line-height:1.6;color:" + th.fgMuted + ";");
+        body.textContent = this.tf(bodyKey, values || {});
+        panel.appendChild(body);
+        const note = this.el("div", "font-size:12px;color:" + th.fgMuted + ";opacity:0.8;margin-top:8px;");
+        note.textContent = this.t("lockedIncluded");
+        panel.appendChild(note);
+        const link = this.buildUpgradeLink(this.t("startTrial"), false);
+        if (link) {
+            link.style.display = "inline-block";
+            link.style.marginTop = "14px";
+            panel.appendChild(link);
+        }
+        overlay.appendChild(panel);
+        // Register as THE modal so closeModal() and the usual modal lifecycle
+        // can dismiss it, like every other overlay in the visual.
+        this.closeModal();
+        this.modalOverlay = overlay;
+        this.target.appendChild(overlay);
+    }
+
+    // Amber strip shown to unlicensed editors: what's free, what isn't.
     buildLicenseBanner(th) {
         const banner = this.el("div",
             "display:flex;align-items:center;gap:12px;padding:10px 14px;" +
             "background:linear-gradient(90deg,#2a1f08,#1a1408);" +
             "border-bottom:2px solid #6b4a1a;color:#ffd87a;font-size:13px;flex-shrink:0;");
         const icon = this.el("span", "font-size:18px;flex-shrink:0;");
-        icon.textContent = "🔒";  // 🔒
+        icon.textContent = "✨";
         banner.appendChild(icon);
         const text = this.el("span", "flex:1;");
-        const lang = this.language || "en";
-        const t = (key) => (TRANSLATIONS[lang] && TRANSLATIONS[lang][key]) || TRANSLATIONS.en[key] || key;
         const strong = this.el("strong", "color:#ffe9a8;margin-right:6px;");
-        strong.textContent = t("licenseRequired") + ".";
+        strong.textContent = this.t("freeTier") + ".";
         text.appendChild(strong);
-        text.appendChild(document.createTextNode(" " + t("licenseDescription")));
+        text.appendChild(document.createTextNode(" " + this.tf("licenseDescription",
+            { a: FREE_AREA_LIMIT, m: FREE_MACHINES_PER_AREA })));
         banner.appendChild(text);
-        const link = document.createElement("a");
-        link.href = APPSOURCE_OFFER_URL;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.textContent = t("startTrial");
-        link.style.cssText =
-            "flex-shrink:0;padding:6px 14px;background:#ffb84d;color:#1a1408;" +
-            "border-radius:4px;text-decoration:none;font-weight:600;";
-        banner.appendChild(link);
+        const link = this.buildUpgradeLink(this.t("startTrial"), true);
+        if (link) banner.appendChild(link);
         return banner;
     }
 
@@ -4567,6 +4767,10 @@ export class Visual {
             if (typeof obj.nextWeekNum === "string" && obj.nextWeekNum !== "0") {
                 this.nextWeekNum = +obj.nextWeekNum || 0;
             }
+            // v3.8.0: license stamp written by a licensed editor. Read on every
+            // update and deliberately NOT written by saveState() — only
+            // reconcileLicenseStamp() may change it, so viewers can't rewrite it.
+            this.licenseStamp = String(obj.licenseStamp || "") === "1";
         } catch (e) {}
     }
 
@@ -4919,8 +5123,9 @@ export class Visual {
             ";color:" + th.fg + ";font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;overflow:hidden;");
         const warn = this.buildBindingWarnings(th);
         if (warn) root.appendChild(warn);
-        // v3.7.45: license banner — shown in Edit mode when no active license.
-        if (this.isEditMode && this.licenseChecked && !this.hasValidLicense) {
+        // v3.8.0: free-tier strip. Editors only — viewers of a free-tier report
+        // just see the free-tier product, without being sold to.
+        if (this.isEditMode && this.licenseChecked && !this.isUnlocked()) {
             root.appendChild(this.buildLicenseBanner(th));
         }
         root.appendChild(this.buildHeader(th));
@@ -5054,11 +5259,27 @@ export class Visual {
             "display:flex;align-items:center;gap:5px;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;" +
             "font-weight:500;border:none;outline:none;background:" + th.accent + ";color:#fff;transition:all 0.15s;");
         this.setSVG(addBtn, '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> ');
-        addBtn.appendChild(document.createTextNode(" " + this.t("addArea")));
+        // v3.8.0: at the free-tier area cap the button stays visible but explains
+        // the limit instead of opening the modal — a dead-looking button reads as
+        // a bug, an explained one reads as a boundary.
+        const areaCapped = !this.canAddArea();
+        addBtn.appendChild(document.createTextNode(
+            " " + this.t("addArea") + (areaCapped ? " 🔒" : "")));
+        if (areaCapped) {
+            addBtn.style.background = th.surfaceHover;
+            addBtn.style.color = th.fgMuted;
+            addBtn.title = this.t("areaCapTitle");
+        }
         addBtn.onmouseover = () => { addBtn.style.opacity = "0.85"; addBtn.style.transform = "translateY(-1px)"; };
         addBtn.onmouseout = () => { addBtn.style.opacity = "1"; addBtn.style.transform = "none"; };
-        addBtn.onclick = () => this.showAreaModal(null);
-        if (this.canEdit()) right.appendChild(addBtn);  // v3.7.45: editors only
+        addBtn.onclick = () => {
+            if (!this.canAddArea()) {
+                this.showCapModal("areaCapTitle", "areaCapBody", { a: FREE_AREA_LIMIT });
+                return;
+            }
+            this.showAreaModal(null);
+        };
+        if (this.canEdit()) right.appendChild(addBtn);  // editors only
         header.appendChild(right);
         return header;
     }
@@ -5164,7 +5385,10 @@ export class Visual {
         this.setSVG(mapIcon, '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="3"/><circle cx="19" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><line x1="7.5" y1="7.5" x2="10.5" y2="16.5"/><line x1="16.5" y1="7.5" x2="13.5" y2="16.5"/></svg>');
         mapTab.appendChild(mapIcon);
         const mapLabel = this.el("span", "");
-        mapLabel.textContent = this.t("pipelineMap");
+        // v3.8.0: padlock marks a paid page, so the placeholder isn't mistaken
+        // for a bug or for missing data.
+        mapLabel.textContent = this.isUnlocked() ? this.t("pipelineMap") : this.t("pipelineMap") + " 🔒";
+        if (!this.isUnlocked()) mapTab.title = this.t("lockedPageTitle");
         mapTab.appendChild(mapLabel);
         mapTab.onmouseover = () => { if (!mapSel) mapTab.style.background = th.surfaceHover; };
         mapTab.onmouseout = () => { if (!mapSel) mapTab.style.background = "transparent"; };
@@ -5182,15 +5406,18 @@ export class Visual {
         this.setSVG(ganttIcon, '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="14" y2="6"/><line x1="7" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="11" y2="18"/></svg>');
         ganttTab.appendChild(ganttIcon);
         const ganttLabel = this.el("span", "");
-        ganttLabel.textContent = this.t("ganttView");
+        ganttLabel.textContent = this.isUnlocked() ? this.t("ganttView") : this.t("ganttView") + " 🔒";
+        if (!this.isUnlocked()) ganttTab.title = this.t("lockedPageTitle");
         ganttTab.appendChild(ganttLabel);
         ganttTab.onmouseover = () => { if (!ganttSel) ganttTab.style.background = th.surfaceHover; };
         ganttTab.onmouseout = () => { if (!ganttSel) ganttTab.style.background = "transparent"; };
         ganttTab.onclick = () => { this.selectedAreaId = "__gantt__"; this.saveState(); this.render(); };
         bar.appendChild(ganttTab);
 
-        // Area tabs (v3.3.70: chain-ordered, mirrors the pipeline view)
-        this._getOrderedAreas().forEach(area => {
+        // Area tabs (v3.3.70: chain-ordered, mirrors the pipeline view).
+        // v3.8.0: capped to the free-tier allowance; the surplus gets one
+        // padlocked chip at the end rather than silently vanishing.
+        this._getOrderedAreas().filter(a => this.isAreaVisible(a.id)).forEach(area => {
             const sel = area.id === this.selectedAreaId || this.selectedAreaId === ("__plan__" + area.id);
             const col = this.typeColor(area.type, th);
             const bgCol = this.typeBgColor(area.type, th);
@@ -5216,6 +5443,21 @@ export class Visual {
             tab.onclick = () => { this.selectedAreaId = area.id; this.saveState(); this.render(); };
             bar.appendChild(tab);
         });
+
+        // v3.8.0: one chip standing in for the areas the free tier doesn't show.
+        const hiddenAreas = this.hiddenAreaCount();
+        if (hiddenAreas > 0) {
+            const moreTab = this.el("div",
+                "display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:8px;cursor:pointer;" +
+                "white-space:nowrap;user-select:none;font-size:12px;transition:all 0.15s;" +
+                "background:transparent;color:" + th.fgMuted + ";border:1px dashed " + th.border + ";");
+            const moreLabel = this.el("span", "");
+            moreLabel.textContent = "+" + hiddenAreas + " 🔒";
+            moreTab.title = this.t("areaCapTitle");
+            moreTab.appendChild(moreLabel);
+            moreTab.onclick = () => this.showCapModal("areaCapTitle", "areaCapBody", { a: FREE_AREA_LIMIT });
+            bar.appendChild(moreTab);
+        }
         return bar;
     }
 
@@ -5245,7 +5487,11 @@ export class Visual {
             const areaId = this.selectedAreaId.replace("__plan__", "");
             const planArea = this.areas.find(a => a.id === areaId);
             if (planArea) {
-                content.appendChild(this.buildPlanPage(planArea, th));
+                // v3.8.0: a saved selection can still point at an area the free
+                // tier no longer shows — explain instead of rendering it.
+                content.appendChild(this.isAreaVisible(areaId)
+                    ? this.buildPlanPage(planArea, th)
+                    : this.buildLockedPage(th, "areaCapTitle", "areaCapBody"));
                 return content;
             }
         }
@@ -5261,6 +5507,12 @@ export class Visual {
         }
         const area = this.areas.find(a => a.id === this.selectedAreaId);
         if (!area) { content.appendChild(this.buildEmpty(th)); return content; }
+        // v3.8.0: same guard as the plan page — a stored selection may point at
+        // an area beyond the free-tier allowance.
+        if (!this.isAreaVisible(area.id)) {
+            content.appendChild(this.buildLockedPage(th, "areaCapTitle", "areaCapBody"));
+            return content;
+        }
 
         // Area header
         const aCol = this.typeColor(area.type, th);
@@ -6088,6 +6340,10 @@ export class Visual {
 
     // Full-page production plan view (dedicated page)
     buildPipelineMapPage(th) {
+        // v3.8.0: paid page. The tab stays, the content becomes a description.
+        if (!this.isUnlocked()) {
+            return this.buildLockedPage(th, "lockedPageTitle", "lockedMapBody");
+        }
         const wrap = this.el("div", "display:flex;flex-direction:column;gap:16px;height:100%;");
 
         // Title
@@ -6463,11 +6719,31 @@ export class Visual {
         const addBtn = this.el("button",
             "padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;" +
             "border:1px solid " + th.accent + ";background:transparent;color:" + th.accent + ";transition:all 0.15s;");
-        addBtn.textContent = "+ " + this.t("addMachine");
-        addBtn.onmouseover = () => { addBtn.style.background = th.accent; addBtn.style.color = "#fff"; };
-        addBtn.onmouseout = () => { addBtn.style.background = "transparent"; addBtn.style.color = th.accent; };
-        addBtn.onclick = (e) => { e.stopPropagation(); this.showAddMachineModal(area, th); };
-        if (this.canEdit()) hdr.appendChild(addBtn);  // v3.7.45: editors only
+        // v3.8.0: per-area machine cap, same treatment as the area cap above.
+        const machineCapped = !this.canAddMachine(area);
+        addBtn.textContent = "+ " + this.t("addMachine") + (machineCapped ? " 🔒" : "");
+        if (machineCapped) {
+            addBtn.style.borderColor = th.border;
+            addBtn.style.color = th.fgMuted;
+            addBtn.title = this.t("machineCapTitle");
+        }
+        addBtn.onmouseover = () => {
+            if (machineCapped) return;
+            addBtn.style.background = th.accent; addBtn.style.color = "#fff";
+        };
+        addBtn.onmouseout = () => {
+            if (machineCapped) return;
+            addBtn.style.background = "transparent"; addBtn.style.color = th.accent;
+        };
+        addBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (!this.canAddMachine(area)) {
+                this.showCapModal("machineCapTitle", "machineCapBody", { m: FREE_MACHINES_PER_AREA });
+                return;
+            }
+            this.showAddMachineModal(area, th);
+        };
+        if (this.canEdit()) hdr.appendChild(addBtn);  // editors only
         section.appendChild(hdr);
 
         if (area.machines.length === 0) {
@@ -6495,7 +6771,9 @@ export class Visual {
 
         // Machine tile grid
         const grid = this.el("div", "display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;");
-        area.machines.forEach((m, idx) => {
+        // v3.8.0: only the machines the free tier covers get a card; the rest are
+        // summarised by one padlocked tile below.
+        this.visibleMachines(area).forEach((m, idx) => {
             // Collect cycle times
             const cts = [];
             for (const dp of this.dataProducts) {
@@ -6677,6 +6955,28 @@ export class Visual {
 
             grid.appendChild(card);
         });
+
+        // v3.8.0: stand-in tile for the machines the free tier doesn't show.
+        const hiddenMachines = ((area.machines || []).length) - this.visibleMachines(area).length;
+        if (hiddenMachines > 0) {
+            const lockCard = this.el("div",
+                "display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;" +
+                "padding:22px 14px;border:1px dashed " + th.border + ";border-radius:10px;cursor:pointer;" +
+                "background:transparent;color:" + th.fgMuted + ";text-align:center;");
+            const lockIcon = this.el("div", "font-size:20px;");
+            lockIcon.textContent = "🔒";
+            lockCard.appendChild(lockIcon);
+            const lockLbl = this.el("div", "font-size:12px;font-weight:600;color:" + th.fg + ";");
+            lockLbl.textContent = "+" + hiddenMachines + " " + this.t("machineCount");
+            lockCard.appendChild(lockLbl);
+            const lockSub = this.el("div", "font-size:11px;line-height:1.5;");
+            lockSub.textContent = this.t("machineCapTitle");
+            lockCard.appendChild(lockSub);
+            lockCard.onclick = () =>
+                this.showCapModal("machineCapTitle", "machineCapBody", { m: FREE_MACHINES_PER_AREA });
+            grid.appendChild(lockCard);
+        }
+
         section.appendChild(grid);
         return section;
     }
@@ -6714,7 +7014,14 @@ export class Visual {
         const virtBtn = this.el("button",
             "flex:1;padding:7px 8px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;outline:none;" +
             "border:1px solid " + th.border + ";background:transparent;color:" + th.fg + ";");
-        virtBtn.textContent = this.t("machineKindVirtual");
+        // v3.8.0: virtual machines are a paid feature. The toggle stays visible
+        // and, when locked, explains what it does rather than disappearing.
+        const virtualLocked = !this.isUnlocked();
+        virtBtn.textContent = this.t("machineKindVirtual") + (virtualLocked ? " 🔒" : "");
+        if (virtualLocked) {
+            virtBtn.style.color = th.fgMuted;
+            virtBtn.title = this.t("lockedFeature");
+        }
         modeRow.appendChild(realBtn);
         modeRow.appendChild(virtBtn);
         modal.appendChild(modeRow);
@@ -6835,7 +7142,14 @@ export class Visual {
             }
         };
         realBtn.onclick = () => setMode("real");
-        virtBtn.onclick = () => setMode("virtual");
+        virtBtn.onclick = () => {
+            if (virtualLocked) {
+                this.closeModal();
+                this.showCapModal("lockedFeature", "virtualLockedBody", {});
+                return;
+            }
+            setMode("virtual");
+        };
         setMode("real");
 
         // Divider
@@ -6859,6 +7173,12 @@ export class Visual {
             const name = getNameValue();
             if (!name) return;
             if (existingNames.has(name)) return;
+            // v3.8.0: enforce the cap at the write as well as on the button.
+            if (!this.canAddMachine(area)) {
+                this.closeModal();
+                this.showCapModal("machineCapTitle", "machineCapBody", { m: FREE_MACHINES_PER_AREA });
+                return;
+            }
             const newMachine = { name: name };
             const alias = getCycleTimeAlias();
             if (alias) newMachine.cycleTimeAlias = alias;
@@ -7783,6 +8103,10 @@ export class Visual {
     // Rows = products, columns = shift slots (this week + next week, non-past),
     // each filled cell is a coloured block with the planned quantity.
     buildGanttPage(th) {
+        // v3.8.0: paid page. The tab stays, the content becomes a description.
+        if (!this.isUnlocked()) {
+            return this.buildLockedPage(th, "lockedPageTitle", "lockedGanttBody");
+        }
         const wrap = this.el("div", "");
         const titleEl = this.el("div", "font-size:18px;font-weight:600;color:" + th.fg + ";margin-bottom:4px;");
         titleEl.textContent = this.t("ganttView");
@@ -9034,6 +9358,13 @@ export class Visual {
                 // v3.3.46: persist product routing
                 area.productRouting = getProductRouting();
             } else {
+                // v3.8.0: enforce the cap at the write, not just on the button,
+                // so an already-open modal can't slip past it.
+                if (!this.canAddArea()) {
+                    this.closeModal();
+                    this.showCapModal("areaCapTitle", "areaCapBody", { a: FREE_AREA_LIMIT });
+                    return;
+                }
                 const newArea = {
                     id: "a" + Date.now().toString(36) + (window.crypto.getRandomValues(new Uint32Array(1))[0]).toString(36).substring(0, 3),
                     type: typeSelect.select.value,
